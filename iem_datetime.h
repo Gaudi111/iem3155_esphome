@@ -2,7 +2,10 @@
 // Utility to parse Schneider iEM3000 DATETIME fields returned as HEXBYTES.
 // Returns "YYYY-MM-DD HH:MM" or "unknown" on invalid data.
 //
-// Suggested PATH for Home Assistant: /config/esphome/includes/iem_datetime.h
+// Suggested PATH for Home Assistant: 
+//       /config/esphome/includes/iem_datetime.h
+// For HASOS (Home Assistant OS), the following path is mapped to the above folder, and should be used from wthin "File editor":
+//       /homeassistant/esphome/includes/iem_datetime.h
 //
 // For referencing in yaml file for ESPHome (your specific configuration may change):
 //
@@ -11,7 +14,7 @@
 // platform: ESP8266
 // board: nodemcuv2
 //  includes:
-//    - iem_datetime.h   # looks for /config/esphome/includes/iem_datetime.h
+//    - iem_datetime.h   # looks for /config/esphome/includes/iem_datetime.h - /homeassistant/esphome/includes/ (in HASOS)
 //
 // Example sensor:
 // 
