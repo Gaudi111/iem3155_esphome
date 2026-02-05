@@ -2,6 +2,37 @@
 // Utility to parse Schneider iEM3000 DATETIME fields returned as HEXBYTES.
 // Returns "YYYY-MM-DD HH:MM" or "unknown" on invalid data.
 //
+// Suggested PATH for Home Assistant: /config/esphome/includes/iem_datetime.h
+//
+// For referencing in yaml file for ESPHome (your specific configuration may change):
+//
+// esphome:
+// name: iem3155_gateway
+// platform: ESP8266
+// board: nodemcuv2
+//  includes:
+//    - iem_datetime.h   # looks for /config/esphome/includes/iem_datetime.h
+//
+// Example sensor:
+// 
+// text_sensor:
+//   - platform: modbus_controller
+//     modbus_controller_id: iem3155
+//     id: meter_current_date_raw
+//     name: "Meter Current Date Raw"
+//     register_type: holding
+//     address: 1844          # manual 1845–1848; ESPHome address = 1845 - 1
+//     register_count: 4
+//     response_size: 8
+//     raw_encode: HEXBYTES
+// 
+//   - platform: template
+//     id: meter_current_date
+//     name: "Meter Current Date"
+//     update_interval: 60s
+//     lambda: |-
+//       return parse_schneider_datetime_hex(id(meter_current_date_raw).state);
+// 
 // Format reference (Schneider DOCA0005EN-15):
 //   Word0: Year (0..99) -> 2000 + (W0 & 0x7F)
 //   Word1: Month (bits 11..8), Weekday (7..5), Day (4..0)
