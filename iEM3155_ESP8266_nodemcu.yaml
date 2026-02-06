@@ -38,6 +38,7 @@
 # It took me some debugging to invert the cables and get the connection working
 
 
+
 #############################################
 #   Substitutions section contains all the  #
 # user/device specific configurable details #
@@ -47,8 +48,6 @@ substitutions:
   friendly_name: iEM3155 Power Meter
   wifi_ssid: !secret wifi_ssid
   wifi_password: !secret wifi_password
-  HA_solar_daily_yield_sensor: sensor.solivia_solar_daily_yield
-
 
 
 ###############################################
@@ -58,25 +57,33 @@ substitutions:
 esphome:
   name: $name
   friendly_name: $friendly_name
+  includes:
+    - includes/iem_datetime.h
+
 
   # If daily_export_base value has not been retained on reboot (e.g. device power cycle)
   # then wait for 20 seconds after api connection and set value to current total export value  
   on_boot:
-    priority: -100
-    then:
-      - wait_until:
-          api.connected:
-      - delay: 20s
-      - lambda: |-
-          if (id(daily_export_base) == -1) {
-            id(daily_export_base) = id(total_energy_export_total).state;
-          }
-      # Fix to prevent initial extreme random register value (six figures) being reported as power_total value on reboots/power cycles
-      # Bug in modbus module or... ?
-      # Initial interval is set to 'never' for modbus controller id(iem3155_freq)
-      - lambda:
-          id(iem3155_freq).set_update_interval(10000);
-          id(iem3155_freq).call_setup(); 
+    # Primero: tu rutina de inicialización temprana
+    - priority: -100
+      then:
+        - wait_until:
+            api.connected:
+        - delay: 20s
+        - lambda: |-
+            if (id(daily_export_base) == -1) {
+              id(daily_export_base) = id(total_energy_export_total).state;
+            }
+        # Fix to prevent initial extreme random register value on reboots
+        - lambda: |-
+            id(iem3155_freq).set_update_interval(10000);
+            id(iem3155_freq).call_setup();
+
+    # Segundo: sincronización de reloj cuando ya tenemos hora de HA
+    # - priority: -10
+    #   then:
+    #     - script.execute: sync_meter_clock
+
 
 esp8266:
   board: nodemcuv2
@@ -95,7 +102,7 @@ uart:
   id: mod_bus
   tx_pin: GPIO01
   rx_pin: GPIO03
-  baud_rate: 9600
+  baud_rate: 19200
   parity: EVEN
   stop_bits: 1
   # Optional debug parameter if TX/TX UART hex data is needed for debugging  
@@ -136,43 +143,11 @@ wifi:
 
 captive_portal:
 
-web_server:
+#web_server:
 
 time:
   - platform: homeassistant
-    id: esptime
-  - platform: sntp
-    on_time:
-      # Reset all four daily import counters at midnight (minus 1 second)
-      # This will also force the command_result id to be updated
-      # Validation check could be performed on command_result sensor
-      # 0 = valid operation (reset all partial registers - ok)
-      # 3000 = invalid operation (reset all partial registers - nok) )
-      - seconds: 59
-        minutes: 59
-        hours: 23
-        days_of_week: MON-SUN
-        then:
-          - component.update: iem3155_daily
-  
-      # Reset daily export base value at midnight
-      # The iEM3155 unfortunately doesn't provide a partial export value register
-      # Instead value is calculated using the total export register and export base value is reset at midnight
-      - seconds: 00
-        minutes: 00
-        hours: 00
-        days_of_week: MON-SUN
-        then:
-          # Set daily_yield sensor to zero at midnight and reset daily_export_base for next day
-          # Can't force an update from HA at 00:00:00 -> 'Old' daily_yield value could potentially result in updating daily_solar_consumption_total with wrong value
-          # Force update both template id sensors that are calculates values (not modbus sensors)
-          # Force update remaining modbus sensors (60 seconds interval)
-          - lambda: |-
-              id(daily_yield).publish_state(0);
-              id(daily_export_base) = id(total_energy_export_total).state;
-              id(daily_energy_export_total).update();
-              id(daily_solar_consumption_total).update();
-          - component.update: iem3155
+    id: ha_time
 
 
 modbus:
@@ -202,6 +177,12 @@ modbus_controller:
     # Only custom_command sensor is using this id (once daily at midnight)
     update_interval: never  
 
+  - id: iem3155_cmd
+    address: 0x01
+    modbus_id: modbus1
+    update_interval: 15s   # <— polling cadence for status registers
+
+
 
 binary_sensor:
   # Optional sensor - Device status sensor
@@ -220,7 +201,11 @@ binary_sensor:
       if (id(digital_input).state == 5) return true; else return false;
 
 sensor:
-  # Optional sensors - Device uptime / Wifi strength db / WiFi strength in percent
+
+###############################################
+### ESPHome General Sensors
+# Optional sensors - Device uptime / Wifi strength db / WiFi strength in percent
+###############################################
   - platform: uptime
     name: "Uptime sensor"
   
@@ -238,56 +223,368 @@ sensor:
     unit_of_measurement: "%"
     entity_category: "diagnostic"
 
-  # Home Assistant solar inverter daily yield sensor value
-  # Sensor only needed for optional calculated sensor (daily_solar_consumption_total) 
-  - platform: homeassistant
-    id: daily_yield
-    entity_id: ${HA_solar_daily_yield_sensor}
-    internal: true
-    filters:
-      - multiply: 0.001
 
-  - platform: template
-    id: daily_energy_export_total
-    name: "Daily Energy Export Total"
-    icon: mdi:transmission-tower-import
-    device_class: energy
-    unit_of_measurement: "kWh"
-    accuracy_decimals: 3
-    # Check for initial export base variable value (-1)
-    # Do not calculate daily export value if initial value is set. Instead return 0
-    update_interval: 60s
-    lambda: |-
-      if (id(daily_export_base) == -1) {
-        return 0;
-      } else {
-        return (id(total_energy_export_total).state - id(daily_export_base));
-      }
-    
-  # Optional daily own solar consumption sensor
-  # Value is calculated using solar_daily_yield sensor from HA    
-  - platform: template
-    id: daily_solar_consumption_total
-    name: "Daily Solar Consumption Total"
-    icon: mdi:solar-power-variant
-    device_class: energy
-    unit_of_measurement: "kWh"
-    accuracy_decimals: 3
-    update_interval: 60s
-    lambda: |-
-      return (id(daily_yield).state - id(daily_energy_export_total).state);
-
-  # Sensors updated every 60 seconds
+###############################################
+### Modbus Registers 'Sensors'
+###############################################
+# System 'Sensors'
+###############################################
   - platform: modbus_controller
     modbus_controller_id: iem3155
-    name: "Voltage avg. All Phases"
-    id: voltage_avg
+    name: "Meter Serial Number"
+    id: meter_sn
+    register_type: holding
+    address: 129
+    value_type: U_DWORD 
+    register_count: 2 
+
+  - platform: modbus_controller
+    modbus_controller_id: iem3155          # <-- adjust to your hub id
+    id: firmware_version_raw
+    internal: true                               # keep this hidden if you prefer
+    name: "Present Firmware Version Raw (UInt16)"
+    register_type: holding
+    address: 1636                                 # manual 1637 → ESPHome address 1636
+    value_type: U_WORD
+
+###############################################
+# Meter Setup and Status 'Sensors'
+###############################################
+  - platform: modbus_controller
+    modbus_controller_id: iem3155
+    name: "Meter Operation Timer"
+    id: meter_operation_timer_raw
+    internal: true
+    register_type: holding
+    address: 2003    ## address of the register inside the Modbus slave device
+    unit_of_measurement: "s"
+    value_type: U_DWORD
+    accuracy_decimals: 0
+
+  - platform: modbus_controller
+    modbus_controller_id: iem3155
+    name: "Number of Phases"
+    id: meter_no_phases
+    register_type: holding
+    address: 2013    ## address of the register inside the Modbus slave device
+    value_type: U_WORD
+    accuracy_decimals: 0
+
+  - platform: modbus_controller
+    modbus_controller_id: iem3155
+    name: "Number of Wires"
+    id: meter_no_wires
+    register_type: holding
+    address: 2014    ## address of the register inside the Modbus slave device
+    value_type: U_WORD
+    accuracy_decimals: 0
+
+  - platform: modbus_controller
+    modbus_controller_id: iem3155
+    id: power_system_code
+    name: "Power System Code"
+    register_type: holding
+    address: 2015
+    value_type: U_WORD
+    internal: true
+
+  - platform: modbus_controller
+    modbus_controller_id: iem3155
+    id: meter_nominal_frequency
+    name: "Nominal Frequency"
+    register_type: holding
+    address: 2016
+    value_type: U_WORD
+
+###############################################
+# Energy Pulse Output Setup 'Sensors'
+###############################################
+
+  - platform: modbus_controller
+    modbus_controller_id: iem3155
+    id: meter_energy_pulse_duration
+    name: "Energy Pulse Duration"
+    register_type: holding
+    address: 2128
+    value_type: U_WORD
+    unit_of_measurement: "ms"
+
+  - platform: modbus_controller
+    modbus_controller_id: iem3155
+    id: meter_do_pulse_assoc_raw
+    internal: true
+    register_type: holding
+    address: 2130      # manual 2131 → ESPHome address = 2131 - 1
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: iem3155
+    id: meter_pulse_weight
+    name: "Pulse Weight (pulse per kWh)"
+    register_type: holding
+    address: 2132
+    value_type: FP32
+
+###############################################
+# Addition to PF Registers 'Sensors'
+###############################################
+  - platform: modbus_controller
+    modbus_controller_id: iem3155
+    id: meter_power_factor_total_iec
+    name: "Power Factor Total IEC"
+    register_type: holding
+    address: 3191
+    value_type: FP32
+
+  - platform: modbus_controller
+    modbus_controller_id: iem3155
+    id: meter_power_factor_total_lead_lag
+    name: "Power Factor Total Lead Lag"
+    register_type: holding
+    address: 3193
+    value_type: FP32
+
+###############################################
+# 1PH4W Multi LN updates 'Sensors'
+###############################################
+  - platform: modbus_controller
+    modbus_controller_id: iem3155
+    id: meter_reactive_energy_delivered_phase_a
+    name: "Reactive Energy Delivered Phase A"
+    register_type: holding
+    address: 45127
+    value_type: FP32
+    unit_of_measurement: "kVARh"
+
+  - platform: modbus_controller
+    modbus_controller_id: iem3155
+    id: meter_reactive_energy_delivered_phase_b
+    name: "Reactive Energy Delivered Phase B"
+    register_type: holding
+    address: 45129
+    value_type: FP32
+    unit_of_measurement: "kVARh"
+
+  - platform: modbus_controller
+    modbus_controller_id: iem3155
+    id: meter_reactive_energy_delivered_phase_c
+    name: "Reactive Energy Delivered Phase C"
+    register_type: holding
+    address: 45131
+    value_type: FP32
+    unit_of_measurement: "kVARh"
+
+###############################################
+# Meter Data 'Sensors'
+# Current
+###############################################
+  - platform: modbus_controller
+    modbus_controller_id: iem3155
+    name: "Phase 1 Current (I1)"
+    id: meter_phase1_current
+    register_type: holding
+    address: 2999
+    icon: mdi:current-ac
+    unit_of_measurement: "A"
+    value_type: FP32
+    accuracy_decimals: 2
+
+  - platform: modbus_controller
+    modbus_controller_id: iem3155
+    name: "Phase 2 Current (I2)"
+    id: meter_phase2_current
+    register_type: holding
+    address: 3001
+    icon: mdi:current-ac
+    unit_of_measurement: "A"
+    value_type: FP32
+    accuracy_decimals: 2
+
+  - platform: modbus_controller
+    modbus_controller_id: iem3155
+    name: "Phase 3 Current (I3)"
+    id: meter_phase3_current
+    register_type: holding
+    address: 3003
+    icon: mdi:current-ac
+    unit_of_measurement: "A"
+    value_type: FP32
+    accuracy_decimals: 2
+
+  - platform: modbus_controller
+    modbus_controller_id: iem3155
+    name: "Current Average"
+    id: meter_current_average
+    register_type: holding
+    address: 3009
+    icon: mdi:current-ac
+    unit_of_measurement: "A"
+    value_type: FP32
+    accuracy_decimals: 2
+
+###############################################
+# Meter Data 'Sensors'
+# Voltage
+###############################################
+  - platform: modbus_controller
+    modbus_controller_id: iem3155
+    name: "Voltage L1-L2"
+    id: voltage_l1_l2
+    register_type: holding
+    address: 3019
+    icon: mdi:current-ac
+    unit_of_measurement: "V"
+    value_type: FP32
+    accuracy_decimals: 2
+
+  - platform: modbus_controller
+    modbus_controller_id: iem3155
+    name: "Voltage L2-L3"
+    id: voltage_l2_l3
+    register_type: holding
+    address: 3021
+    icon: mdi:current-ac
+    unit_of_measurement: "V"
+    value_type: FP32
+    accuracy_decimals: 2
+
+  - platform: modbus_controller
+    modbus_controller_id: iem3155
+    name: "Voltage L3-L1"
+    id: voltage_l3_l1
+    register_type: holding
+    address: 3023
+    icon: mdi:current-ac
+    unit_of_measurement: "V"
+    value_type: FP32
+    accuracy_decimals: 2
+
+  - platform: modbus_controller
+    modbus_controller_id: iem3155
+    name: "Voltage L-L Average"
+    id: voltage_l_l_average
+    register_type: holding
+    address: 3025
+    icon: mdi:current-ac
+    unit_of_measurement: "V"
+    value_type: FP32
+    accuracy_decimals: 2
+
+  - platform: modbus_controller
+    modbus_controller_id: iem3155
+    name: "Voltage L1-N"
+    id: voltage_l1_n
+    register_type: holding
+    address: 3027
+    icon: mdi:current-ac
+    unit_of_measurement: "V"
+    value_type: FP32
+    accuracy_decimals: 2
+
+  - platform: modbus_controller
+    modbus_controller_id: iem3155
+    name: "Voltage L2-N"
+    id: voltage_l2_n
+    register_type: holding
+    address: 3029
+    icon: mdi:current-ac
+    unit_of_measurement: "V"
+    value_type: FP32
+    accuracy_decimals: 2
+
+  - platform: modbus_controller
+    modbus_controller_id: iem3155
+    name: "Voltage L3-N"
+    id: voltage_l3_n
+    register_type: holding
+    address: 3031
+    icon: mdi:current-ac
+    unit_of_measurement: "V"
+    value_type: FP32
+    accuracy_decimals: 2
+
+  - platform: modbus_controller
+    modbus_controller_id: iem3155
+    name: "Voltage L-N (all phases) Average"
+    id: voltage_l_n_average
     register_type: holding
     address: 3035
     icon: mdi:current-ac
     unit_of_measurement: "V"
     value_type: FP32
-    accuracy_decimals: 0
+    accuracy_decimals: 2
+
+###############################################
+# Meter Data 'Sensors'
+# Power
+###############################################
+  - platform: modbus_controller
+    modbus_controller_id: iem3155
+    name: "Active Power Phase 1"
+    id: active_power_ph1
+    register_type: holding
+    address: 3053
+    icon: mdi:current-ac
+    unit_of_measurement: "kW"
+    value_type: FP32
+    accuracy_decimals: 2
+
+  - platform: modbus_controller
+    modbus_controller_id: iem3155
+    name: "Active Power Phase 2"
+    id: active_power_ph2
+    register_type: holding
+    address: 3055
+    icon: mdi:current-ac
+    unit_of_measurement: "kW"
+    value_type: FP32
+    accuracy_decimals: 2
+
+  - platform: modbus_controller
+    modbus_controller_id: iem3155
+    name: "Active Power Phase 3"
+    id: active_power_ph3
+    register_type: holding
+    address: 3057
+    icon: mdi:current-ac
+    unit_of_measurement: "kW"
+    value_type: FP32
+    accuracy_decimals: 2
+
+  - platform: modbus_controller
+    modbus_controller_id: iem3155
+    name: "Total Active Power"
+    id: active_power_total
+    register_type: holding
+    address: 3059
+    icon: mdi:current-ac
+    unit_of_measurement: "kW"
+    value_type: FP32
+    accuracy_decimals: 2
+
+  - platform: modbus_controller
+    modbus_controller_id: iem3155
+    name: "Total Reactive Power"
+    id: reactive_power_total
+    register_type: holding
+    address: 3067
+    icon: mdi:current-ac
+    unit_of_measurement: "kVAR"
+    value_type: FP32
+    accuracy_decimals: 2
+
+  - platform: modbus_controller
+    modbus_controller_id: iem3155
+    name: "Total Aparent Power"
+    id: aparent_power_total
+    register_type: holding
+    address: 3075
+    icon: mdi:current-ac
+    unit_of_measurement: "kVA"
+    value_type: FP32
+    accuracy_decimals: 2
+
+
 
   - platform: modbus_controller
     modbus_controller_id: iem3155
@@ -331,7 +628,7 @@ sensor:
   # Sensor updated every 10 seconds 
   - platform: modbus_controller
     modbus_controller_id: iem3155_freq
-    name: "Total Active Power"
+    name: "Total Active Power W"
     id: power_total
     register_type: holding
     address: 3059
@@ -342,18 +639,26 @@ sensor:
       - multiply: 1000
     accuracy_decimals: 0
    
-  # Sensors updated every 60 seconds
+
+###############################################
+# Meter Data 'Sensors'
+# Power Factor
+###############################################
   - platform: modbus_controller
     modbus_controller_id: iem3155
-    name: "Power Factor"
-    id: power_factor
+    name: "Total Power Factor"
+    id: power_factor_total
     register_type: holding
     address: 3083
     icon: mdi:power-settings
     value_type: FP32
     accuracy_decimals: 2
     ## Possible float values from: -2 to +1
-    
+
+###############################################
+# Meter Data 'Sensors'
+# Frequency
+###############################################
   - platform: modbus_controller
     modbus_controller_id: iem3155
     name: "Frequency"
@@ -364,6 +669,148 @@ sensor:
     unit_of_measurement: "Hz"
     value_type: FP32
     accuracy_decimals: 2
+
+
+# ============================================================
+# iEM3155 — Energy values (32-bit Float) via Modbus
+# Manual: DOCA0005EN-15 → Energy values – 32-bit floating point (45100..45126)
+# ESPHome usa 'address' (a menudo register-1): p. ej., 45100 → 45099
+# Ajusta solo si en tu entorno no aplica offset.
+# ============================================================
+  # ---------------------------
+  # Total Energy (cannot be reset) — total_increasing
+  # ---------------------------
+  - platform: modbus_controller
+    modbus_controller_id: iem3155
+    name: "Total Active Energy Import"
+    id: total_active_energy_import
+    register_type: holding
+    address: 45099         # reg 45100 → addr 45099
+    value_type: FP32
+    device_class: energy
+    state_class: total_increasing
+    unit_of_measurement: kWh
+
+  - platform: modbus_controller
+    modbus_controller_id: iem3155
+    name: "Total Active Energy Export"
+    id: total_active_energy_export
+    register_type: holding
+    address: 45101         # reg 45102 → addr 45101
+    value_type: FP32
+    device_class: energy
+    state_class: total_increasing
+    unit_of_measurement: kWh
+
+  - platform: modbus_controller
+    modbus_controller_id: iem3155
+    name: "Total Reactive Energy Import"
+    id: total_reactive_energy_import
+    register_type: holding
+    address: 45103         # reg 45104 → addr 45103
+    value_type: FP32
+    state_class: total_increasing
+    unit_of_measurement: kVARh
+
+  - platform: modbus_controller
+    modbus_controller_id: iem3155
+    name: "Total Reactive Energy Export"
+    id: total_reactive_energy_export
+    register_type: holding
+    address: 45105         # reg 45106 → addr 45105
+    value_type: FP32
+    state_class: total_increasing
+    unit_of_measurement: kVARh
+
+  # ---------------------------
+  # Partial Energy — puede resetearse → total
+  # ---------------------------
+  - platform: modbus_controller
+    modbus_controller_id: iem3155
+    name: "Partial Active Energy Import"
+    id: partial_active_energy_import
+    register_type: holding
+    address: 45107         # reg 45108 → addr 45107
+    value_type: FP32
+    device_class: energy
+    state_class: total
+    unit_of_measurement: kWh
+
+  - platform: modbus_controller
+    modbus_controller_id: iem3155
+    name: "Partial Reactive Energy Import"
+    id: partial_reactive_energy_import
+    register_type: holding
+    address: 45109         # reg 45110 → addr 45109
+    value_type: FP32
+    state_class: total
+    unit_of_measurement: kVARh
+
+  # ---------------------------
+  # Phase Energy — (usa total; si nunca reseteás, podrías cambiar a total_increasing)
+  # ---------------------------
+  - platform: modbus_controller
+    modbus_controller_id: iem3155
+    name: "Active Energy Import Phase 1"
+    id: active_energy_import_phase_1
+    register_type: holding
+    address: 45111         # reg 45112 → addr 45111
+    value_type: FP32
+    device_class: energy
+    state_class: total
+    unit_of_measurement: kWh
+
+  - platform: modbus_controller
+    modbus_controller_id: iem3155
+    name: "Active Energy Import Phase 2"
+    id: active_energy_import_phase_2
+    register_type: holding
+    address: 45113         # reg 45114 → addr 45113
+    value_type: FP32
+    device_class: energy
+    state_class: total
+    unit_of_measurement: kWh
+
+  - platform: modbus_controller
+    modbus_controller_id: iem3155
+    name: "Active Energy Import Phase 3"
+    id: active_energy_import_phase_3
+    register_type: holding
+    address: 45115         # reg 45116 → addr 45115
+
+
+
+
+
+
+
+
+
+
+
+  - platform: template
+    id: daily_energy_export_total
+    name: "Daily Energy Export Total"
+    icon: mdi:transmission-tower-import
+    device_class: energy
+    unit_of_measurement: "kWh"
+    accuracy_decimals: 3
+    # Check for initial export base variable value (-1)
+    # Do not calculate daily export value if initial value is set. Instead return 0
+    update_interval: 60s
+    lambda: |-
+      if (id(daily_export_base) == -1) {
+        return 0;
+      } else {
+        return (id(total_energy_export_total).state - id(daily_export_base));
+      }
+    
+
+
+
+
+    
+
 
   - platform: modbus_controller
     modbus_controller_id: iem3155
@@ -454,28 +901,10 @@ sensor:
     value_type: FP32
     accuracy_decimals: 3
     
-  # Sensors updated at midnight 
-  - platform: modbus_controller
-    modbus_controller_id: iem3155_daily
-    name: "Command result"
-    id: command_result
-    # Command Result codes:
-    # 0 = Valid Operation
-    # 3000 = Invalid Command
-    # 3001 = Invalid Parameter
-    # 3002 = Invalid Number of Parameters
-    # 3007 = Operation Not Performed
-    
-    # This register returns 0 if daily import registers has been
-    # reset correctly at midnight. Returns 3000 if device has
-    # Com.Protection enabled
-    # Sensor can be checked in HA to ensure partial counters
-    # has been reset correctly
-    register_type: holding
-    address: 5375
-    icon: mdi:restart
-    value_type: U_WORD
-    
+
+
+
+
   - platform: modbus_controller
     modbus_controller_id: iem3155_daily
     name: "Reset command"
@@ -492,3 +921,400 @@ sensor:
     # command parameters in register 5252: 0x000 (this command has no parameters)
     custom_command: [ 0x01, 0x10, 0x14, 0x81, 0x00, 0x02, 0x04, 0x07, 0xE4, 0x00, 0x00 ]
     value_type: FP32
+
+
+  - platform: modbus_controller
+    modbus_controller_id: iem3155_cmd
+    name: "Command Status - Command Number"
+    id: cmd_status_number
+    register_type: holding
+    address: 5374          # manual 5375 -> ESPHome address offset -1
+    value_type: U_WORD
+
+  - platform: modbus_controller
+    modbus_controller_id: iem3155_cmd
+    name: "Command Status - Result Code"
+    id: cmd_status_result
+    register_type: holding
+    icon: mdi:restart
+    address: 5375          # manual 5376 -> ESPHome address offset -1
+    value_type: U_WORD
+    # Command Result codes:
+    # 0 = Valid Operation
+    # 3000 = Invalid Command
+    # 3001 = Invalid Parameter
+    # 3002 = Invalid Number of Parameters
+    # 3007 = Operation Not Performed
+
+
+
+# 6) Clock drift sensor (minutes): HA time - Meter time (from DATETIME @1845..1848)
+#    Parses meter_current_date_raw HEX and compares with HA time.
+  - platform: template
+    id: meter_clock_drift_min
+    name: "Meter Clock Drift (min)"
+    unit_of_measurement: "min"
+    update_interval: 60s
+    lambda: |-
+      if (!id(ha_time).now().is_valid()) return NAN;
+      std::string hex = id(meter_current_date_raw).state;
+      if (hex.empty()) return NAN;
+
+      // Keep only hex chars
+      std::string cleaned; cleaned.reserve(hex.size());
+      for (char c : hex) {
+        if ((c >= '0' && c <= '9') ||
+            (c >= 'A' && c <= 'F') ||
+            (c >= 'a' && c <= 'f')) {
+          cleaned.push_back(c);
+        }
+      }
+      if (cleaned.size() < 16) return NAN;
+
+      // 2-hex to byte
+      auto h2n = [](char x) -> int {
+        if (x >= '0' && x <= '9') return x - '0';
+        if (x >= 'A' && x <= 'F') return x - 'A' + 10;
+        if (x >= 'a' && x <= 'f') return x - 'a' + 10;
+        return -1;
+      };
+      auto b2i = [&](char h, char l) -> int {
+        int hi = h2n(h), lo = h2n(l);
+        return (hi < 0 || lo < 0) ? -1 : ((hi << 4) | lo);
+      };
+
+      std::vector<uint8_t> bytes; bytes.reserve(cleaned.size()/2);
+      for (size_t i = 0; i + 1 < cleaned.size(); i += 2) {
+        int b = b2i(cleaned[i], cleaned[i+1]);
+        if (b < 0) return NAN;
+        bytes.push_back(static_cast<uint8_t>(b));
+      }
+      if (bytes.size() < 8) return NAN;
+
+      auto word_at = [&](int idx) -> uint16_t {
+        return (static_cast<uint16_t>(bytes[idx * 2]) << 8) |
+               static_cast<uint16_t>(bytes[idx * 2 + 1]);
+      };
+
+      uint16_t w_year = word_at(0);
+      uint16_t w_mowd = word_at(1);
+      uint16_t w_hm   = word_at(2);
+
+      int year   = 2000 + (w_year & 0x7F);
+      int month  = (w_mowd >> 8) & 0x0F;
+      int day    =  w_mowd       & 0x1F;
+      int hour   = (w_hm   >> 8) & 0x1F;
+      int minute =  w_hm         & 0x3F;
+
+      if (month < 1 || month > 12 || day < 1 || day > 31 ||
+          hour > 23 || minute > 59) return NAN;
+
+      struct tm tm_meter = {};
+      tm_meter.tm_year = year - 1900;
+      tm_meter.tm_mon  = month - 1;
+      tm_meter.tm_mday = day;
+      tm_meter.tm_hour = hour;
+      tm_meter.tm_min  = minute;
+      tm_meter.tm_sec  = 0;
+      time_t meter_t = mktime(&tm_meter);
+
+      auto now = id(ha_time).now();
+      struct tm tm_ha = {};
+      tm_ha.tm_year = now.year - 1900;
+      tm_ha.tm_mon  = now.month - 1;
+      tm_ha.tm_mday = now.day_of_month;
+      tm_ha.tm_hour = now.hour;
+      tm_ha.tm_min  = now.minute;
+      tm_ha.tm_sec  = 0;
+      time_t ha_t = mktime(&tm_ha);
+
+      if (meter_t == (time_t)-1 || ha_t == (time_t)-1) return NAN;
+
+      double diff_s = difftime(ha_t, meter_t);
+      return diff_s / 60.0;
+
+
+text_sensor:
+  - platform: version
+    name: ESPHome Version
+
+
+###############################################
+### Modbus Registers Text_Sensors
+###############################################
+#     System
+###############################################
+
+  - platform: modbus_controller
+    modbus_controller_id: iem3155
+    name: "Meter Name"
+    id: meter_name
+    register_type: holding
+    address: 29
+    register_count: 20
+    response_size: 40
+  
+  - platform: modbus_controller
+    modbus_controller_id: iem3155
+    name: "Meter Model"
+    id: meter_model
+    register_type: holding
+    address: 49
+    register_count: 20
+    response_size: 40
+
+  - platform: modbus_controller
+    modbus_controller_id: iem3155
+    name: "Meter Manufacturer"
+    id: meter_manufacturer
+    register_type: holding
+    address: 69
+    register_count: 20
+    response_size: 40
+
+  - platform: modbus_controller
+    modbus_controller_id: iem3155
+    name: "Hardware Revision"
+    id: meter_hw_rev
+    register_type: holding
+    address: 135
+    register_count: 5
+    response_size: 10
+
+
+  - platform: template
+    id: fw_dlf_formatted
+    name: "Present Firmware Version (DLF)"
+    update_interval: 30s                          # or 'never' if you prefer on-demand updates
+    lambda: |-
+      // Convert the raw UInt16 (DLF) to X.Y.ZTT
+      // DLF decimal model: DLF = X*1000 + Y*100 + Z*10 + TT
+      // Example: 10503 -> 1.0.5 03 -> "1.0.503"
+      uint16_t v = static_cast<uint16_t>(id(firmware_version_raw).state);
+
+      int X  = (v / 1000) % 10;
+      int Y  = (v / 100)  % 10;
+      int Z  = (v / 10)   % 10;
+      int TT =  v % 100;
+
+      if (X < 0 || X > 9 || Y < 0 || Y > 9 || Z < 0 || Z > 9 || TT < 0 || TT > 99) {
+        return std::string("unknown");
+      }
+
+      char out[16];
+      // Format "X.Y.ZTT" ensuring TT has two digits
+      snprintf(out, sizeof(out), "%d.%d.%d%02d", X, Y, Z, TT);
+      return std::string(out);
+
+
+###############################################
+# Energy Pulse Output Setup 'Text_Sensors'
+###############################################
+  - platform: template
+    name: "Digital Output Association (Pulse)"
+    lambda: |-
+      return (static_cast<uint16_t>(id(meter_do_pulse_assoc_raw).state) == 1)
+        ? std::string("Enabled (DO1 for active energy pulse)")
+        : std::string("Disabled");
+
+
+
+###############################################
+# 1PH4W Multi LN updates 'Text_Sensors'
+###############################################
+  - platform: modbus_controller
+    modbus_controller_id: iem3155
+    name: "Phase 1 Name"
+    id: meter_phase_1_name
+    register_type: holding
+    address: 56999
+    register_count: 5
+    response_size: 10
+
+  - platform: modbus_controller
+    modbus_controller_id: iem3155
+    name: "Phase 2 Name"
+    id: meter_phase_2_name
+    register_type: holding
+    address: 57004
+    register_count: 5
+    response_size: 10
+
+  - platform: modbus_controller
+    modbus_controller_id: iem3155
+    name: "Phase 3 Name"
+    id: meter_phase_3_name
+    register_type: holding
+    address: 57009
+    register_count: 5
+    response_size: 10
+
+
+###############################################
+# Meter Data 'Text_Sensors'
+# Power Factor
+###############################################
+# ============================================================
+# Text state for Total Power Factor (register 3084)
+# Maps numeric PF to quadrant + sign + reactive nature
+# Reference: DOCA0005EN-15, Total Power Factor ranges (reg 3084).
+# ============================================================
+# ============================================================
+# Descriptive text state for Total Power Factor (register 3084)
+# Includes the raw PF value in the final string for diagnostics
+# ============================================================
+  - platform: template
+    id: power_factor_total_state
+    name: "Total Power Factor State"
+    update_interval: 10s
+    lambda: |-
+      // Read numeric PF from your existing sensor
+      float pf = id(power_factor_total).state;
+
+      // Handle NaN
+      if (isnan(pf)) return std::string("Unknown (PF is NaN)");
+
+      // Absolute out-of-range guard (PF mapped range is (-2, 2))
+      if (pf <= -2.0f || pf >= 2.0f) {
+        char buf[96];
+        snprintf(buf, sizeof(buf), "Out of range (|PF| ≥ 2) — PF=%.3f", pf);
+        return std::string(buf);
+      }
+
+      // Zero often means no real power or not enough load to compute PF reliably
+      if (pf == 0.0f) {
+        char buf[96];
+        snprintf(buf, sizeof(buf), "PF = 0.000 — No active power (insufficient load or idle)");
+        return std::string(buf);
+      }
+
+      // Unity special cases (boundary conditions)
+      if (pf == 1.0f) {
+        char buf[96];
+        snprintf(buf, sizeof(buf), "Unity PF (PF = +1.000) — Active power positive, minimal reactive component");
+        return std::string(buf);
+      }
+      if (pf == -1.0f) {
+        char buf[96];
+        snprintf(buf, sizeof(buf), "Unity PF (PF = −1.000) — Active power negative, minimal reactive component");
+        return std::string(buf);
+      }
+
+      // Per iEM3000 mapping of Total PF (reg 3084):
+      //   0   < PF < 1   -> Quadrant 1 (P > 0, inductive)
+      //   1   < PF < 2   -> Quadrant 4 (P > 0, capacitive)
+      //  −1  < PF < 0   -> Quadrant 2 (P < 0, capacitive)
+      //  −2  < PF < −1  -> Quadrant 3 (P < 0, inductive)
+      const char* msg = nullptr;
+      if (pf > 0.0f && pf < 1.0f)
+        msg = "Quadrant 1 — Active power positive (P>0), inductive reactive component";
+      else if (pf > 1.0f && pf < 2.0f)
+        msg = "Quadrant 4 — Active power positive (P>0), capacitive reactive component";
+      else if (pf > -1.0f && pf < 0.0f)
+        msg = "Quadrant 2 — Active power negative (P<0), capacitive reactive component";
+      else if (pf > -2.0f && pf < -1.0f)
+        msg = "Quadrant 3 — Active power negative (P<0), inductive reactive component";
+
+      // Fallback (should not trigger unless PF is at other exact boundaries)
+      if (msg == nullptr) {
+        char buf[96];
+        snprintf(buf, sizeof(buf), "Unclassified boundary case — PF=%.3f", pf);
+        return std::string(buf);
+      }
+
+      // Build final message with raw PF appended
+      char buf[128];
+      snprintf(buf, sizeof(buf), "%s — PF=%.3f", msg, pf);
+      return std::string(buf);
+
+
+
+  # 1) Raw DATETIME block read as HEX bytes
+  - platform: modbus_controller
+    modbus_controller_id: iem3155      # <- adjust if your controller id differs (e.g., iem3155_slow)
+    id: meter_manuf_date_raw
+    name: "Meter Manufacture Date Raw"
+    internal: true
+    register_type: holding
+    address: 131            # manual shows 132; ESPHome commonly uses -1 offset → 131
+    register_count: 4       # 4 words = 8 bytes
+    response_size: 8
+    raw_encode: HEXBYTES    # returns a hex string representing the 8 raw bytes
+
+  
+  # 2) Parser: converts HEXBYTES into a readable datetime string
+  - platform: template
+    id: meter_manuf_date
+    name: "IEM3155 Manufacture Date"
+    update_interval: 60s
+    lambda: |-
+      return parse_schneider_datetime_hex(id(meter_manuf_date_raw).state);
+
+
+# ============================================================
+# iEM3155 - Current Date/Time (DATETIME) decoding
+# Reads 4 words (8 bytes) at Modbus register 1845–1848 (manual),
+# which in ESPHome typically maps to address 1844 (offset -1).
+# Output: "YYYY-MM-DD HH:MM"
+# ============================================================
+
+  # 1) Raw DATETIME block read as HEX bytes
+  - platform: modbus_controller
+    modbus_controller_id: iem3155          # <-- adjust if your controller id differs
+    id: meter_current_date_raw
+    name: "Meter Current Date Raw"
+    register_type: holding
+    address: 1844                           # manual shows 1845; ESPHome often uses -1 offset → 1844
+    register_count: 4                       # 4 words = 8 bytes
+    response_size: 8
+    raw_encode: HEXBYTES                    # returns hex string for the 8 raw bytes
+
+  # 2) Parser: converts HEXBYTES into a readable datetime string
+  - platform: template
+    id: meter_current_date
+    name: "Meter Current Date"
+    update_interval: 60s
+    lambda: |-
+      return parse_schneider_datetime_hex(id(meter_current_date_raw).state);
+
+
+
+ 
+  - platform: template
+    name: Meter Operation Timer Readable
+    id: meter_operation_timer
+    lambda: |-
+      int seconds = (id(meter_operation_timer_raw).state);
+      int days = seconds / (24 * 3600);
+      seconds = seconds % (24 * 3600); 
+      int hours = seconds / 3600;
+      seconds = seconds % 3600;
+      int minutes = seconds /  60;
+      seconds = seconds % 60;
+      return { (String(days) +"d " + String(hours) +"h " + String(minutes) +"m "+ String(seconds) +"s").c_str() };
+    icon: mdi:clock-start
+    update_interval: 30s
+
+  - platform: template
+    name: "Power System"
+    id: meter_power_system
+    lambda: |-
+      if (!id(power_system_code).has_state()) return {};
+
+      static const std::map<uint16_t, std::string> table = {
+        {0,  "1PH2W L-N"},
+        {1,  "1PH2W L-L"},
+        {2,  "1PH3W L-L with N"},
+        {3,  "3PH3W"},
+        {11, "3PH4W"},
+        {13, "1PH4W multi L with N"}
+      };
+
+      uint16_t v = (uint16_t) id(power_system_code).state;
+
+      auto it = table.find(v);
+      if (it != table.end()) {
+        return it->second;
+      }
+
+      return std::string("Unknown (") + to_string(v) + ")";
