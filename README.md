@@ -49,7 +49,13 @@ Extremely easy, full Home Assistant integration using ESPHome as wireless Modbus
 * Supports both 3.3 and 5v
 ![TTL/RS485 module](https://github.com/Gaudi111/iem3155_esphome/blob/main/RS485-TTL_Module.webp)
 
-## RS485 <-> NodeMCU Wiring 
+
+
+## Wiring Schematics
+![Wiring](https://github.com/Gaudi111/iem3155_esphome/blob/main/ESP8266-RS485-TTL-iEM3155_Wiring.png)
+
+
+### RS485 <-> NodeMCU Wiring 
 <pre>
 TTL-RS485 Module  |  ESP8266  |  
   VCC                  3V (in my setup it works fine @3.3V, so no need for 5V)
@@ -69,9 +75,7 @@ TTL-RS485 Module  |  ESP8266  |
     baud_rate: 0
 ```
 
-
-
-## RS485 <-> Schneider iEM3155 Meter Wiring
+### RS485 <-> Schneider iEM3155 Meter Wiring
 <pre>
 TTL-RS485 Module  |  iEM3155  |  
   Data B                D0/-
